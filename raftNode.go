@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -11,7 +12,6 @@ import (
 	"strconv"
 	"sync"
 	"time"
-	"errors"
 )
 
 // RaftNode represents a single Raft node in the cluster, providing the
@@ -24,6 +24,7 @@ type RaftNode int
 type VoteArguments struct {
 	Term        int
 	CandidateID int
+	Index       int
 	Address     string
 }
 
@@ -58,6 +59,11 @@ type ServerConnection struct {
 	rpcConnection *rpc.Client
 }
 
+type LogEntry struct {
+	Index int
+	Term  int
+}
+
 var selfID int
 var serverNodes map[string]ServerConnection
 var currentTerm int
@@ -66,6 +72,7 @@ var isLeader bool
 var myPort string
 var mutex sync.Mutex // to lock global variables
 var electionTimeout *time.Timer
+var logs []LogEntry
 
 // resetElectionTimeout resets the election timeout to a new random duration.
 // This function should be called whenever an event occurs that prevents the need for a new election,
@@ -104,7 +111,7 @@ func (*RaftNode) RequestVote(arguments VoteArguments, reply *VoteReply) error {
 	reply.Term = currentTerm
 
 	// grant vote if node has not voted
-	if votedFor == -1 {
+	if votedFor == -1 && arguments.Index >= logs[len(logs)-1:][0].Index {
 		fmt.Println("Voting for candidate", arguments.CandidateID)
 		reply.ResultVote = true
 		votedFor = arguments.CandidateID
@@ -122,8 +129,8 @@ func Reconnect(newId int, address string) error {
 	fmt.Println("Attempting to reconnect with", address)
 	for {
 		select {
-		case <- connectTimer.C:
-			return errors.New("connection timed out") 
+		case <-connectTimer.C:
+			return errors.New("connection timed out")
 		default:
 			client, err := rpc.DialHTTP("tcp", address)
 			if err != nil {
@@ -135,7 +142,7 @@ func Reconnect(newId int, address string) error {
 				serverNodes[address].rpcConnection.Close()
 				serverNodes[address] = ServerConnection{serverID: newId, Address: address, rpcConnection: client}
 				mutex.Unlock()
-				return nil	
+				return nil
 			}
 		}
 	}
