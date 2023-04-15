@@ -41,9 +41,9 @@ type AppendEntryArgument struct {
 	Term     int
 	LeaderID int
 	Address  string
-	LastLogIndex	int		// important metadata for log correctness
-	LastLogTerm		int		// important metadata for log correctness
-	CommitLeader	int 	// what index have been received by the majority
+	LastLogIndex	int		// check log length
+	LastLogTerm		int		// check last log term
+	CommitLeader	int 	// what index has been received by the majority
 	LogEntry string
 }
 
@@ -68,12 +68,14 @@ type ServerConnection struct {
 var selfID int
 var serverNodes map[string]ServerConnection
 var currentTerm int
+var currLogTerm int
 var votedFor int
 var isLeader bool
 var myPort string
 var mutex sync.Mutex // to lock global variables
 var electionTimeout *time.Timer
 var selfLog []string
+
 
 // resetElectionTimeout resets the election timeout to a new random duration.
 // This function should be called whenever an event occurs that prevents the need for a new election,
@@ -258,6 +260,7 @@ func LeaderElection() {
 // role as leader.
 func Heartbeat() {
 	heartbeatTimer := time.NewTimer(100 * time.Millisecond)
+	i := 0
 	for {
 		<-heartbeatTimer.C
 		mutex.Lock()
@@ -265,12 +268,16 @@ func Heartbeat() {
 			mutex.Unlock()
 			return
 		}
-
+		newEntry := strconv.Itoa(i) + strconv.Itoa(selfID)
 		arguments := AppendEntryArgument{
 			Term:     currentTerm,
 			LeaderID: selfID,
 			Address:  myPort,
+			LogEntry: newEntry,
+			LastLogTerm: currLogTerm,
+			LastLogIndex: len(selfLog) - 2,
 		}
+		selfLog = append(selfLog, newEntry)
 		mutex.Unlock()
 
 		fmt.Println("Sending heartbeats")
@@ -335,6 +342,7 @@ func main() {
 	votedFor = -1
 	isLeader = false // starts in the follower state
 	selfLog = make([]string, 0, 10)
+	currLogTerm = 0
 	mutex = sync.Mutex{}
 
 
