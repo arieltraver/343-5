@@ -163,7 +163,6 @@ func (*RaftNode) AppendEntry(arguments AppendEntryArgument, reply *AppendEntryRe
 	if arguments.Term < currentTerm {
 		reply.Term = currentTerm
 		reply.Success = false // not a valid heartbeat
-		isLeader = false
 		go Reconnect(arguments.LeaderID, arguments.Address)
 		return nil
 	}
@@ -175,9 +174,11 @@ func (*RaftNode) AppendEntry(arguments AppendEntryArgument, reply *AppendEntryRe
 	} else if arguments.LastLogIndex > len(selfLog) {
 		fmt.Println("this node is behind the leader") //todo: do something
 		reply.Success = false
+		isLeader = false
 		return nil
 	} else {
 		selfLog = append(selfLog, arguments.LogEntry)
+		fmt.Println(arguments.LogEntry)
 	}
 
 
@@ -200,61 +201,77 @@ func (*RaftNode) AppendEntry(arguments AppendEntryArgument, reply *AppendEntryRe
 func LeaderElection() {
 	for {
 		<-electionTimeout.C // wait for election timeout
-
+		
+		mutex.Lock()
 		// check if node is already leader so loop does not continue
 		if isLeader {
 			fmt.Println("ending leaderelection because I am now leader")
+			mutex.Unlock()
 			return
 		}
 
-		mutex.Lock()
 		// initialize election
 		currentTerm++     // new term
 		votedFor = selfID // votes for itself
-
-		mutex.Unlock()
 
 		arguments := VoteArguments{
 			Term:        currentTerm,
 			CandidateID: selfID,
 			Address:     myPort,
 		}
-
-		voteCount := 1
+		l := len(serverNodes)
+		mutex.Unlock()
+		votes := make(chan bool, l)
 
 		// request votes from other nodes
 		fmt.Println("Requesting votes")
 		for _, server := range serverNodes {
-			go func(server ServerConnection) {
-				reply := VoteReply{}
-				err := server.rpcConnection.Call("RaftNode.RequestVote", arguments, &reply)
-				if err != nil {
-					return
-				}
-
-				mutex.Lock()
-				defer mutex.Unlock()
-
-				if reply.Term > currentTerm {
-					currentTerm = reply.Term // update current term
-					votedFor = -1            // reset votedFor
-				} else if reply.ResultVote {
-					voteCount++
-					// receives votes from a majority of the servers
-					if !isLeader && voteCount > len(serverNodes)/2 {
-						fmt.Println("Won election! ->", voteCount, "votes for", selfID)
-						isLeader = true // enters leader state
-						go Heartbeat()  // begins sending heartbeats
-						return
-					}
-				}
-
-			}(server)
+			go req(server, votes, arguments)
 		}
-		resetElectionTimeout()
+		go awaitElection(votes, l/2 + 1)
+		go resetElectionTimeout()
 	}
 }
 
+func req(server ServerConnection, votes chan bool, arguments VoteArguments) {
+	reply := VoteReply{}
+	err := server.rpcConnection.Call("RaftNode.RequestVote", arguments, &reply)
+	if err != nil {
+		log.Fatal(err)
+	}
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	if reply.Term > currentTerm {
+		currentTerm = reply.Term // update current term
+		votedFor = -1            // reset votedFor
+		isLeader = false
+	} else if reply.ResultVote {
+		votes <- true
+	}
+}
+
+//this waits on votes
+func awaitElection(votes chan bool, majority int) {
+	voteCount := 1
+	voteTimer := time.NewTimer(200 * time.Millisecond)
+	for {
+		select {
+		case <- voteTimer.C:
+			return
+		case <- votes:
+			voteCount ++
+			if voteCount >= majority {
+				mutex.Lock()
+				isLeader = true
+				mutex.Unlock()
+				fmt.Println("won the election")
+				go Heartbeat()
+				return
+			}
+		}
+	}
+}
 // Heartbeat is used when the current node is a leader; it handles the periodic
 // sending of heartbeat messages to other nodes in the cluster to establish its
 // role as leader.
@@ -287,6 +304,7 @@ func Heartbeat() {
 				server.rpcConnection.Call("RaftNode.AppendEntry", arguments, &reply)
 			}(server)
 		}
+		i++
 		heartbeatTimer.Reset(100 * time.Millisecond)
 	}
 }
@@ -345,17 +363,11 @@ func main() {
 	currLogTerm = 0
 	mutex = sync.Mutex{}
 
-
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	tRandom := time.Duration(r.Intn(150)+151) * time.Millisecond
 	electionTimeout = time.NewTimer(tRandom)
 
 	// --- Register the RPCs of this object of type RaftNode
-	api := new(RaftNode)
-	err = rpc.Register(api)
-	if err != nil {
-		log.Fatal("error registering the RPCs", err)
-	}
 	rpc.HandleHTTP()
 	go http.ListenAndServe(myPort, nil)
 	log.Printf("serving rpc on port" + myPort)
@@ -392,6 +404,12 @@ func main() {
 		serverNodes[element] = ServerConnection{index, element, client}
 		// Record that in log
 		fmt.Println("Connected to " + element)
+	}
+
+	api := new(RaftNode)
+	err = rpc.Register(api)
+	if err != nil {
+		log.Fatal("error registering the RPCs", err)
 	}
 
 	var wg sync.WaitGroup
