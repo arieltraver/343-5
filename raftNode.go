@@ -41,6 +41,10 @@ type AppendEntryArgument struct {
 	Term     int
 	LeaderID int
 	Address  string
+	LastLogIndex	int		// important metadata for log correctness
+	LastLogTerm		int		// important metadata for log correctness
+	CommitLeader	int 	// what index have been received by the majority
+	LogEntry string
 }
 
 // AppendEntryReply represents the response from a Raft node after processing a
@@ -49,6 +53,8 @@ type AppendEntryArgument struct {
 type AppendEntryReply struct {
 	Term    int
 	Success bool
+	MismatchTerm int //last term where a conflict occurs
+	MismatchIndex int //the index of the log where there's a mismatch
 }
 
 // ServerConnection represents a connection to another node in the Raft cluster.
@@ -58,6 +64,7 @@ type ServerConnection struct {
 	rpcConnection *rpc.Client
 }
 
+
 var selfID int
 var serverNodes map[string]ServerConnection
 var currentTerm int
@@ -66,6 +73,7 @@ var isLeader bool
 var myPort string
 var mutex sync.Mutex // to lock global variables
 var electionTimeout *time.Timer
+var selfLog []string
 
 // resetElectionTimeout resets the election timeout to a new random duration.
 // This function should be called whenever an event occurs that prevents the need for a new election,
@@ -157,6 +165,19 @@ func (*RaftNode) AppendEntry(arguments AppendEntryArgument, reply *AppendEntryRe
 		go Reconnect(arguments.LeaderID, arguments.Address)
 		return nil
 	}
+
+	if arguments.LastLogIndex < len(selfLog) - 2 { //outdated log from leader
+		fmt.Println("this node is ahead of leader") //todo: do something with this
+		reply.Success = false
+		return nil
+	} else if arguments.LastLogIndex > len(selfLog) {
+		fmt.Println("this node is behind the leader") //todo: do something
+		reply.Success = false
+		return nil
+	} else {
+		selfLog = append(selfLog, arguments.LogEntry)
+	}
+
 
 	// if leader's term is greater or equal, its leadership is valid
 	currentTerm = arguments.Term
@@ -313,7 +334,9 @@ func main() {
 	currentTerm = 0
 	votedFor = -1
 	isLeader = false // starts in the follower state
+	selfLog = make([]string, 0, 10)
 	mutex = sync.Mutex{}
+
 
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	tRandom := time.Duration(r.Intn(150)+151) * time.Millisecond
