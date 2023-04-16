@@ -109,6 +109,7 @@ func (*RaftNode) RequestVote(arguments VoteArguments, reply *VoteReply) error {
 	if arguments.Term > currentTerm {
 		currentTerm = arguments.Term // update current term
 		votedFor = -1                // has not voted in this new term
+		isLeader = false
 	}
 
 	reply.Term = currentTerm
@@ -145,6 +146,7 @@ func Reconnect(newId int, address string) error {
 				serverNodes[address].rpcConnection.Close()
 				serverNodes[address] = ServerConnection{serverID: newId, Address: address, rpcConnection: client}
 				mutex.Unlock()
+
 				return nil	
 			}
 		}
@@ -158,39 +160,35 @@ func Reconnect(newId int, address string) error {
 func (*RaftNode) AppendEntry(arguments AppendEntryArgument, reply *AppendEntryReply) error {
 	mutex.Lock()
 	defer mutex.Unlock()
+	reply.MismatchIndex = -1
 
 	// if leader's term is less than current term, reject append entry request
-	if arguments.Term < currentTerm {
+	if arguments.Term < currentTerm || arguments.LastLogIndex < len(selfLog) - 2 {
+		fmt.Println("this node is ahead of the leader")
 		reply.Term = currentTerm
 		reply.Success = false // not a valid heartbeat
 		go Reconnect(arguments.LeaderID, arguments.Address)
 		return nil
 	}
-
-	if arguments.LastLogIndex < len(selfLog) - 2 { //outdated log from leader
-		fmt.Println("this node is ahead of leader") //todo: do something with this
-		reply.Success = false
-		return nil
-	} else if arguments.LastLogIndex > len(selfLog) {
+	if arguments.LastLogIndex >= len(selfLog) {
 		fmt.Println("this node is behind the leader") //todo: do something
+		//todo: ask leader to replicate its log.
 		reply.Success = false
+		reply.MismatchIndex = len(selfLog) - 1
+		reply.MismatchTerm = currentTerm
 		isLeader = false
+		go resetElectionTimeout()
 		return nil
 	} else {
 		selfLog = append(selfLog, arguments.LogEntry)
-		fmt.Println(arguments.LogEntry)
+		currentTerm = arguments.Term
+		isLeader = false
+		reply.Success = true
+		go resetElectionTimeout()
+		fmt.Println("received heartbeat:", arguments.LogEntry)
+		return nil
 	}
 
-
-	// if leader's term is greater or equal, its leadership is valid
-	currentTerm = arguments.Term
-	isLeader = false // current node is follower
-	reply.Term = currentTerm
-	reply.Success = true
-	resetElectionTimeout() // heartbeat indicates a leader, so no new election
-	fmt.Println("Received heartbeat")
-
-	return nil
 }
 
 // LeaderElection initiates and manages the election process for the RaftNode. It
@@ -201,7 +199,7 @@ func (*RaftNode) AppendEntry(arguments AppendEntryArgument, reply *AppendEntryRe
 func LeaderElection() {
 	for {
 		<-electionTimeout.C // wait for election timeout
-		
+
 		mutex.Lock()
 		// check if node is already leader so loop does not continue
 		if isLeader {
@@ -211,9 +209,8 @@ func LeaderElection() {
 		}
 
 		// initialize election
-		currentTerm++     // new term
+		currentTerm++
 		votedFor = selfID // votes for itself
-
 		arguments := VoteArguments{
 			Term:        currentTerm,
 			CandidateID: selfID,
@@ -222,13 +219,12 @@ func LeaderElection() {
 		l := len(serverNodes)
 		mutex.Unlock()
 		votes := make(chan bool, l)
-
 		// request votes from other nodes
 		fmt.Println("Requesting votes")
 		for _, server := range serverNodes {
 			go req(server, votes, arguments)
 		}
-		go awaitElection(votes, l/2 + 1)
+		go awaitElection(votes, l/2 + 2)
 		go resetElectionTimeout()
 	}
 }
@@ -237,7 +233,7 @@ func req(server ServerConnection, votes chan bool, arguments VoteArguments) {
 	reply := VoteReply{}
 	err := server.rpcConnection.Call("RaftNode.RequestVote", arguments, &reply)
 	if err != nil {
-		log.Fatal(err)
+		return
 	}
 	mutex.Lock()
 	defer mutex.Unlock()
@@ -302,6 +298,15 @@ func Heartbeat() {
 			go func(server ServerConnection) {
 				reply := AppendEntryReply{}
 				server.rpcConnection.Call("RaftNode.AppendEntry", arguments, &reply)
+				mutex.Lock()
+				defer mutex.Unlock()
+				if reply.Term > currentTerm {
+					fmt.Println("error, this is term", reply.Term, "I am in", currentTerm)
+					isLeader = false
+					return
+				} else if reply.MismatchIndex != -1 {
+					log.Println("worker has log error at", reply.MismatchIndex)
+				}
 			}(server)
 		}
 		i++
