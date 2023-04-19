@@ -18,6 +18,11 @@ import (
 // necessary methods to handle Raft RPC calls.
 type RaftNode int
 
+type logEntry struct {
+	index int
+	term  int
+}
+
 // VoteArguments contains the candidate information needed to request a vote
 // from a Raft node during an election and for the node to decide whether to
 // vote for the candidate in question.
@@ -44,7 +49,7 @@ type AppendEntryArgument struct {
 	LastLogIndex	int		// check log length
 	LastLogTerm		int		// check last log term
 	CommitLeader	int 	// what index has been received by the majority
-	LogEntry string
+	LogEntry logEntry
 }
 
 // AppendEntryReply represents the response from a Raft node after processing a
@@ -74,7 +79,7 @@ var isLeader bool
 var myPort string
 var mutex sync.Mutex // to lock global variables
 var electionTimeout *time.Timer
-var selfLog []string
+var selfLog []logEntry
 
 
 // resetElectionTimeout resets the election timeout to a new random duration.
@@ -146,7 +151,6 @@ func Reconnect(newId int, address string) error {
 				serverNodes[address].rpcConnection.Close()
 				serverNodes[address] = ServerConnection{serverID: newId, Address: address, rpcConnection: client}
 				mutex.Unlock()
-
 				return nil	
 			}
 		}
@@ -160,9 +164,10 @@ func Reconnect(newId int, address string) error {
 func (*RaftNode) AppendEntry(arguments AppendEntryArgument, reply *AppendEntryReply) error {
 	mutex.Lock()
 	defer mutex.Unlock()
-	reply.MismatchIndex = -1
 
-	// if leader's term is less than current term, reject append entry request
+	/*
+	if we are ahead of the leader:
+	*/
 	if arguments.Term < currentTerm || arguments.LastLogIndex < len(selfLog) - 2 {
 		fmt.Println("this node is ahead of the leader")
 		reply.Term = currentTerm
@@ -170,8 +175,11 @@ func (*RaftNode) AppendEntry(arguments AppendEntryArgument, reply *AppendEntryRe
 		go Reconnect(arguments.LeaderID, arguments.Address)
 		return nil
 	}
-	if arguments.LastLogIndex >= len(selfLog) {
-		fmt.Println("this node is behind the leader") //todo: do something
+	/*
+	if we look back one node, and see a problem:
+	*/
+	if selfLog[arguments.LastLogIndex].term != arguments.LastLogTerm {
+		fmt.Println("there is an error in our log") //todo: do something
 		//todo: ask leader to replicate its log.
 		reply.Success = false
 		reply.MismatchIndex = len(selfLog) - 1
@@ -179,6 +187,10 @@ func (*RaftNode) AppendEntry(arguments AppendEntryArgument, reply *AppendEntryRe
 		isLeader = false
 		go resetElectionTimeout()
 		return nil
+
+	/*
+	if everything is fine:
+	*/
 	} else {
 		selfLog = append(selfLog, arguments.LogEntry)
 		currentTerm = arguments.Term
@@ -200,72 +212,57 @@ func LeaderElection() {
 	for {
 		<-electionTimeout.C // wait for election timeout
 
-		mutex.Lock()
 		// check if node is already leader so loop does not continue
 		if isLeader {
 			fmt.Println("ending leaderelection because I am now leader")
-			mutex.Unlock()
 			return
 		}
 
+		mutex.Lock()
 		// initialize election
-		currentTerm++
+		currentTerm++     // new term
 		votedFor = selfID // votes for itself
+
+		mutex.Unlock()
+
 		arguments := VoteArguments{
 			Term:        currentTerm,
 			CandidateID: selfID,
 			Address:     myPort,
 		}
-		l := len(serverNodes)
-		mutex.Unlock()
-		votes := make(chan bool, l)
+
+		voteCount := 1
+
 		// request votes from other nodes
 		fmt.Println("Requesting votes")
 		for _, server := range serverNodes {
-			go req(server, votes, arguments)
-		}
-		go awaitElection(votes, l/2 + 2)
-		go resetElectionTimeout()
-	}
-}
+			go func(server ServerConnection) {
+				reply := VoteReply{}
+				err := server.rpcConnection.Call("RaftNode.RequestVote", arguments, &reply)
+				if err != nil {
+					return
+				}
 
-func req(server ServerConnection, votes chan bool, arguments VoteArguments) {
-	reply := VoteReply{}
-	err := server.rpcConnection.Call("RaftNode.RequestVote", arguments, &reply)
-	if err != nil {
-		return
-	}
-	mutex.Lock()
-	defer mutex.Unlock()
-
-	if reply.Term > currentTerm {
-		currentTerm = reply.Term // update current term
-		votedFor = -1            // reset votedFor
-		isLeader = false
-	} else if reply.ResultVote {
-		votes <- true
-	}
-}
-
-//this waits on votes
-func awaitElection(votes chan bool, majority int) {
-	voteCount := 1
-	voteTimer := time.NewTimer(200 * time.Millisecond)
-	for {
-		select {
-		case <- voteTimer.C:
-			return
-		case <- votes:
-			voteCount ++
-			if voteCount >= majority {
 				mutex.Lock()
-				isLeader = true
-				mutex.Unlock()
-				fmt.Println("won the election")
-				go Heartbeat()
-				return
-			}
+				defer mutex.Unlock()
+
+				if reply.Term > currentTerm {
+					currentTerm = reply.Term // update current term
+					votedFor = -1            // reset votedFor
+				} else if reply.ResultVote {
+					voteCount++
+					// receives votes from a majority of the servers
+					if !isLeader && voteCount > len(serverNodes)/2 {
+						fmt.Println("Won election! ->", voteCount, "votes for", selfID)
+						isLeader = true // enters leader state
+						go Heartbeat()  // begins sending heartbeats
+						return
+					}
+				}
+
+			}(server)
 		}
+		resetElectionTimeout()
 	}
 }
 // Heartbeat is used when the current node is a leader; it handles the periodic
@@ -273,7 +270,6 @@ func awaitElection(votes chan bool, majority int) {
 // role as leader.
 func Heartbeat() {
 	heartbeatTimer := time.NewTimer(100 * time.Millisecond)
-	i := 0
 	for {
 		<-heartbeatTimer.C
 		mutex.Lock()
@@ -281,35 +277,38 @@ func Heartbeat() {
 			mutex.Unlock()
 			return
 		}
-		newEntry := strconv.Itoa(i) + strconv.Itoa(selfID)
+		if len(selfLog) == 0 {
+			selfLog = append(selfLog, logEntry{index:0,term:0})
+		}
+		lastIndex := selfLog[len(selfLog)-1].index
+		lastTerm := selfLog[len(selfLog)-1].term
+		entryIndex := lastIndex + 1
+		newEntry := logEntry{index:entryIndex,term:currentTerm} //TODO: get the correct entry.
 		arguments := AppendEntryArgument{
 			Term:     currentTerm,
 			LeaderID: selfID,
 			Address:  myPort,
 			LogEntry: newEntry,
-			LastLogTerm: currLogTerm,
-			LastLogIndex: len(selfLog) - 2,
+			LastLogTerm: lastTerm,
+			LastLogIndex: lastIndex,
 		}
-		selfLog = append(selfLog, newEntry)
+		ct := currentTerm
 		mutex.Unlock()
 
 		fmt.Println("Sending heartbeats")
 		for _, server := range serverNodes {
-			go func(server ServerConnection) {
-				reply := AppendEntryReply{}
-				server.rpcConnection.Call("RaftNode.AppendEntry", arguments, &reply)
+			reply := AppendEntryReply{}
+			server.rpcConnection.Call("RaftNode.AppendEntry", arguments, &reply)
+			if reply.Term > ct {
+				fmt.Println("error, this is term", reply.Term, "I am in", currentTerm)
 				mutex.Lock()
-				defer mutex.Unlock()
-				if reply.Term > currentTerm {
-					fmt.Println("error, this is term", reply.Term, "I am in", currentTerm)
-					isLeader = false
-					return
-				} else if reply.MismatchIndex != -1 {
-					log.Println("worker has log error at", reply.MismatchIndex)
-				}
-			}(server)
+				isLeader = false
+				mutex.Unlock()
+				return
+			} else if reply.MismatchIndex != -1 {
+				log.Println("worker has log error at", reply.MismatchIndex)
+			}
 		}
-		i++
 		heartbeatTimer.Reset(100 * time.Millisecond)
 	}
 }
@@ -364,7 +363,7 @@ func main() {
 	currentTerm = 0
 	votedFor = -1
 	isLeader = false // starts in the follower state
-	selfLog = make([]string, 0, 10)
+	selfLog = make([]logEntry, 0, 10)
 	currLogTerm = 0
 	mutex = sync.Mutex{}
 
