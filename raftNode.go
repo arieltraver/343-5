@@ -59,7 +59,6 @@ type AppendEntryReply struct {
 	Term    int
 	Success bool
 	MismatchTerm int //last term where a conflict occurs
-	MismatchIndex int //the index of the log where there's a mismatch
 }
 
 // ServerConnection represents a connection to another node in the Raft cluster.
@@ -182,11 +181,9 @@ func (*RaftNode) AppendEntry(arguments AppendEntryArgument, reply *AppendEntryRe
 		//todo: ask leader to replicate its log.
 		reply.Success = false
 		reply.MismatchIndex = len(selfLog) - 1
-		reply.MismatchTerm = currentTerm
 		isLeader = false
 		go resetElectionTimeout()
 		return nil
-
 	/*
 	if everything is fine:
 	*/
