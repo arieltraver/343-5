@@ -167,7 +167,7 @@ func (*RaftNode) AppendEntry(arguments AppendEntryArgument, reply *AppendEntryRe
 	/*
 	if we are ahead of the leader:
 	*/
-	if arguments.Term < currentTerm || arguments.LastLogIndex < len(selfLog) - 2 {
+	if arguments.Term < currentTerm {
 		fmt.Println("this node is ahead of the leader")
 		reply.Term = currentTerm
 		reply.Success = false // not a valid heartbeat
