@@ -73,7 +73,6 @@ type ServerConnection struct {
 var selfID int
 var serverNodes map[string]ServerConnection
 var currentTerm int
-var currLogTerm int
 var votedFor int
 var isLeader bool
 var myPort string
