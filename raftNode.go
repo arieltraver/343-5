@@ -360,7 +360,6 @@ func main() {
 	votedFor = -1
 	isLeader = false // starts in the follower state
 	selfLog = make([]logEntry, 0, 10)
-	currLogTerm = 0
 	mutex = sync.Mutex{}
 
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
