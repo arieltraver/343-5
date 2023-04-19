@@ -58,7 +58,7 @@ type AppendEntryArgument struct {
 type AppendEntryReply struct {
 	Term    int
 	Success bool
-	MismatchTerm int //last term where a conflict occurs
+	MismatchIndex int //last term where a conflict occurs
 }
 
 // ServerConnection represents a connection to another node in the Raft cluster.
