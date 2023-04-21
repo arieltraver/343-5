@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -11,7 +12,6 @@ import (
 	"strconv"
 	"sync"
 	"time"
-	"errors"
 )
 
 // RaftNode represents a single Raft node in the cluster, providing the
@@ -24,6 +24,7 @@ type RaftNode int
 type VoteArguments struct {
 	Term        int
 	CandidateID int
+	Index       int
 	Address     string
 }
 
@@ -58,6 +59,11 @@ type ServerConnection struct {
 	rpcConnection *rpc.Client
 }
 
+type LogEntry struct {
+	Index int
+	Term  int
+}
+
 var selfID int
 var serverNodes map[string]ServerConnection
 var currentTerm int
@@ -66,6 +72,8 @@ var isLeader bool
 var myPort string
 var mutex sync.Mutex // to lock global variables
 var electionTimeout *time.Timer
+var logs []LogEntry
+var lastAppliedIndex int
 
 // resetElectionTimeout resets the election timeout to a new random duration.
 // This function should be called whenever an event occurs that prevents the need for a new election,
@@ -104,7 +112,7 @@ func (*RaftNode) RequestVote(arguments VoteArguments, reply *VoteReply) error {
 	reply.Term = currentTerm
 
 	// grant vote if node has not voted
-	if votedFor == -1 {
+	if votedFor == -1 && arguments.Index >= logs[len(logs)-1:][0].Index {
 		fmt.Println("Voting for candidate", arguments.CandidateID)
 		reply.ResultVote = true
 		votedFor = arguments.CandidateID
@@ -122,8 +130,8 @@ func Reconnect(newId int, address string) error {
 	fmt.Println("Attempting to reconnect with", address)
 	for {
 		select {
-		case <- connectTimer.C:
-			return errors.New("connection timed out") 
+		case <-connectTimer.C:
+			return errors.New("connection timed out")
 		default:
 			client, err := rpc.DialHTTP("tcp", address)
 			if err != nil {
@@ -135,7 +143,7 @@ func Reconnect(newId int, address string) error {
 				serverNodes[address].rpcConnection.Close()
 				serverNodes[address] = ServerConnection{serverID: newId, Address: address, rpcConnection: client}
 				mutex.Unlock()
-				return nil	
+				return nil
 			}
 		}
 	}
@@ -261,6 +269,48 @@ func Heartbeat() {
 		}
 		heartbeatTimer.Reset(100 * time.Millisecond)
 	}
+}
+
+/*
+This function is designed to emulate a client reaching out to the
+server. Note that many of the realistic details are removed, for
+simplicity
+*/
+func ClientAddToLog() {
+	// In a realistic scenario, the client will find the leader node and communicate with it
+	// In this implementation, we are pretending that the client reached out to the server somehow
+	// But any new log entries will not be created unless the server/node is a leader
+	// isLeader here is a boolean to indicate whether the node is a leader or not
+	if isLeader {
+		// lastAppliedIndex here is an int variable that is needed by a node to store the value of the last index it used in the log
+		entry := LogEntry{lastAppliedIndex, currentTerm}
+		log.Println("Client communication created the new log entry at index " + strconv.Itoa(entry.Index))
+		lastAppliedIndex++
+		time.Sleep(5 * time.Second)
+
+		mutex.Lock()
+		arguments := AppendEntryArgument{
+			Term:     currentTerm,
+			LeaderID: selfID,
+			Address:  myPort,
+		}
+		mutex.Unlock()
+
+		for _, server := range serverNodes {
+			go func(server ServerConnection) {
+				reply := AppendEntryReply{}
+				server.rpcConnection.Call("RaftNode.AppendEntry", arguments, &reply)
+			}(server)
+		}
+		// Add rest of logic here
+		// HINT 1: using the AppendEntry RPC might happen here
+		//1) actual entry
+	}
+	/* HINT 2: force the thread to sleep for a good amount of time (less
+	   than that of the leader election timer) and then repeat the actions above.
+	   You may use an endless loop here or recursively call the function
+	*/
+	// HINT 3: you don’t need to add to the logic of creating new log entries, just handle the replication
 }
 
 func main() {
