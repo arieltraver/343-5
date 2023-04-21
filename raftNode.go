@@ -116,7 +116,7 @@ func (*RaftNode) RequestVote(arguments VoteArguments, reply *VoteReply) error {
 
 	// grant vote if node has not voted
 	if votedFor == -1 {
-		if arguments.Term > logs[len(logs)-1:][0].Term || (arguments.Term == logs[len(logs)-1:][0].Term && arguments.Index >= logs[len(logs)-1:][0].Index) {
+		if len(logs) == 0 || (arguments.Term > logs[len(logs)-1:][0].Term || (arguments.Term == logs[len(logs)-1:][0].Term && arguments.Index >= logs[len(logs)-1:][0].Index)) {
 			fmt.Println("Voting for candidate", arguments.CandidateID)
 			reply.ResultVote = true
 			votedFor = arguments.CandidateID
@@ -172,7 +172,7 @@ func (*RaftNode) AppendEntry(arguments AppendEntryArgument, reply *AppendEntryRe
 		go Reconnect(arguments.LeaderID, arguments.Address)
 		return nil
 	}
-	if logs[arguments.PrevLogIndex].Term != arguments.PrevLogTerm {
+	if len(logs) > 0 && logs[arguments.PrevLogIndex].Term != arguments.PrevLogTerm {
 		reply.Success = false
 		log.Println("received conflicting log from leader")
 		//go Reconnect(arguments.LeaderID, arguments.Address)
@@ -219,6 +219,7 @@ func LeaderElection() {
 		// initialize election
 		currentTerm++     // new term
 		votedFor = selfID // votes for itself
+		sc := serverNodes
 
 		mutex.Unlock()
 
@@ -232,7 +233,8 @@ func LeaderElection() {
 
 		// request votes from other nodes
 		fmt.Println("Requesting votes")
-		for _, server := range serverNodes {
+
+		for _, server := range sc {
 			go func(server ServerConnection) {
 				reply := VoteReply{}
 				err := server.rpcConnection.Call("RaftNode.RequestVote", arguments, &reply)
