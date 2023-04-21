@@ -77,6 +77,7 @@ var mutex sync.Mutex // to lock global variables
 var electionTimeout *time.Timer
 var logs []LogEntry
 var lastAppliedIndex int
+var nextIndex map[int]int
 
 // resetElectionTimeout resets the election timeout to a new random duration.
 // This function should be called whenever an event occurs that prevents the need for a new election,
@@ -116,7 +117,7 @@ func (*RaftNode) RequestVote(arguments VoteArguments, reply *VoteReply) error {
 
 	// grant vote if node has not voted
 	if votedFor == -1 {
-		if len(logs) == 0 || (arguments.Term > logs[len(logs)-1:][0].Term || (arguments.Term == logs[len(logs)-1:][0].Term && arguments.Index >= logs[len(logs)-1:][0].Index)) {
+		if len(logs) == 0 || (arguments.Term > logs[len(logs)-1].Term || (arguments.Term == logs[len(logs)-1].Term && arguments.Index >= logs[len(logs)-1].Index)) {
 			fmt.Println("Voting for candidate", arguments.CandidateID)
 			reply.ResultVote = true
 			votedFor = arguments.CandidateID
@@ -189,6 +190,9 @@ func (*RaftNode) AppendEntry(arguments AppendEntryArgument, reply *AppendEntryRe
 		}
 	}
 
+	for _, entry := range(logs) {
+		fmt.Println("entry:", entry.Index, "term:", entry.Term)
+	}
 	// if leader's term is greater or equal, its leadership is valid
 	currentTerm = arguments.Term
 	isLeader = false // current node is follower
@@ -209,13 +213,14 @@ func LeaderElection() {
 	for {
 		<-electionTimeout.C // wait for election timeout
 
+		mutex.Lock()
 		// check if node is already leader so loop does not continue
 		if isLeader {
 			fmt.Println("ending leaderelection because I am now leader")
+			mutex.Unlock()
 			return
 		}
 
-		mutex.Lock()
 		// initialize election
 		currentTerm++     // new term
 		votedFor = selfID // votes for itself
@@ -243,6 +248,7 @@ func LeaderElection() {
 				}
 
 				mutex.Lock()
+				
 				defer mutex.Unlock()
 
 				if reply.Term > currentTerm {
@@ -297,40 +303,57 @@ func Heartbeat() {
 	}
 }
 
+
+func client() {
+	for {
+		time.Sleep(5 * time.Second)
+		clientAddToLog()
+	}
+}
 /*
 This function is designed to emulate a client reaching out to the
 server. Note that many of the realistic details are removed, for
 simplicity
 */
-func ClientAddToLog() {
+func clientAddToLog() {
 	// In a realistic scenario, the client will find the leader node and communicate with it
 	// In this implementation, we are pretending that the client reached out to the server somehow
 	// But any new log entries will not be created unless the server/node is a leader
 	// isLeader here is a boolean to indicate whether the node is a leader or not
+	mutex.Lock()
+
 	if isLeader {
 		// lastAppliedIndex here is an int variable that is needed by a node to store the value of the last index it used in the log
 		entry := LogEntry{lastAppliedIndex, currentTerm}
+		logs = append(logs, entry) //append new entry to our log.
 		log.Println("Client communication created the new log entry at index " + strconv.Itoa(entry.Index))
 		lastAppliedIndex++
-		time.Sleep(5 * time.Second)
 
-		mutex.Lock()
 		arguments := AppendEntryArgument{
 			Term:     currentTerm,
 			LeaderID: selfID,
 			Address:  myPort,
+			PrevLogIndex: len(logs)-1,
+			PrevLogTerm: logs[len(logs)-1].Term,
 		}
 		mutex.Unlock()
 
 		for _, server := range serverNodes {
 			go func(server ServerConnection) {
+				arguments.Entries = logs[nextIndex[server.serverID]:] //from the next index onward.
 				reply := AppendEntryReply{}
-				server.rpcConnection.Call("RaftNode.AppendEntry", arguments, &reply)
+				for { //keep trying if there are errors
+					server.rpcConnection.Call("RaftNode.AppendEntry", arguments, &reply)
+					if reply.Success {
+						break; //good job no errors
+					}
+					nextIndex[server.serverID] -= 1 //check for <0 condition?... should not occur
+				}
+				nextIndex[server.serverID] = len(logs) //onto the next thing.
 			}(server)
 		}
-		// Add rest of logic here
-		// HINT 1: using the AppendEntry RPC might happen here
-		//1) actual entry
+	} else {
+		mutex.Unlock()
 	}
 	/* HINT 2: force the thread to sleep for a good amount of time (less
 	   than that of the leader election timer) and then repeat the actions above.
@@ -442,5 +465,7 @@ func main() {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go LeaderElection() // concurrent and non-stop leader election
+	go client()
 	wg.Wait()           // waits forever, so main process does not stop
+
 }
