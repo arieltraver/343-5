@@ -248,7 +248,7 @@ func LeaderElection() {
 				}
 
 				mutex.Lock()
-				
+
 				defer mutex.Unlock()
 
 				if reply.Term > currentTerm {
@@ -261,6 +261,10 @@ func LeaderElection() {
 						fmt.Println("Won election! ->", voteCount, "votes for", selfID)
 						isLeader = true // enters leader state
 						lastAppliedIndex = 0
+						//initialize next_index for all nodes.
+						for _, server := range(serverNodes) {
+							nextIndex[server.serverID] = len(logs)
+						}
 						go Heartbeat()  // begins sending heartbeats
 						return
 					}
@@ -462,10 +466,12 @@ func main() {
 		fmt.Println("Connected to " + element)
 	}
 
+	nextIndex = make(map[int]int)
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go LeaderElection() // concurrent and non-stop leader election
 	go client()
 	wg.Wait()           // waits forever, so main process does not stop
+
 
 }
