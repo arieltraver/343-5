@@ -67,6 +67,15 @@ type LogEntry struct {
 	Term  int
 }
 
+type Logs struct {
+	logs []LogEntry
+	m sync.Mutex
+}
+
+type indexMap struct {
+	nextIndex map[int]int
+	m sync.Mutex
+}
 var selfID int
 var serverNodes map[string]ServerConnection
 var currentTerm int
@@ -75,9 +84,9 @@ var isLeader bool
 var myPort string
 var mutex sync.Mutex // to lock global variables
 var electionTimeout *time.Timer
-var logs []LogEntry
+var logs Logs
 var lastAppliedIndex int
-var nextIndex map[int]int
+var nextIndex indexMap
 
 // resetElectionTimeout resets the election timeout to a new random duration.
 // This function should be called whenever an event occurs that prevents the need for a new election,
@@ -117,7 +126,9 @@ func (*RaftNode) RequestVote(arguments VoteArguments, reply *VoteReply) error {
 
 	// grant vote if node has not voted
 	if votedFor == -1 {
-		if len(logs) == 0 || (arguments.Term > logs[len(logs)-1].Term || (arguments.Term == logs[len(logs)-1].Term && arguments.Index >= logs[len(logs)-1].Index)) {
+		logs.m.Lock()
+		if len(logs.logs) == 0 || (arguments.Term > logs.logs[len(logs.logs)-1].Term || (arguments.Term == logs.logs[len(logs.logs)-1].Term && arguments.Index >= logs.logs[len(logs.logs)-1].Index)) {
+			logs.m.Unlock()
 			fmt.Println("Voting for candidate", arguments.CandidateID)
 			reply.ResultVote = true
 			votedFor = arguments.CandidateID
@@ -173,7 +184,7 @@ func (*RaftNode) AppendEntry(arguments AppendEntryArgument, reply *AppendEntryRe
 		go Reconnect(arguments.LeaderID, arguments.Address)
 		return nil
 	}
-	if len(logs) > 0 && logs[arguments.PrevLogIndex].Term != arguments.PrevLogTerm {
+	if arguments.PrevLogIndex > 0 && len(logs.logs) > arguments.PrevLogIndex && logs.logs[arguments.PrevLogIndex].Term != arguments.PrevLogTerm {
 		reply.Success = false
 		log.Println("received conflicting log from leader")
 		//go Reconnect(arguments.LeaderID, arguments.Address)
@@ -181,16 +192,18 @@ func (*RaftNode) AppendEntry(arguments AppendEntryArgument, reply *AppendEntryRe
 	}
 
 	for i, entry := range(arguments.Entries) {
-		if entry.Index >= len(logs) {
-			logs = append(logs, arguments.Entries[i:]...) //append all new.
+		if entry.Index >= len(logs.logs) {
+			logs.m.Lock()
+			logs.logs = append(logs.logs, arguments.Entries[i:]...) //append all new.
+			logs.m.Unlock()
 			break; //done here
 		}
-		if logs[entry.Index].Term != entry.Term {
-			logs[entry.Index] = entry //correct the inorrect entry
+		if logs.logs[entry.Index].Term != entry.Term {
+			logs.logs[entry.Index] = entry //correct the inorrect entry
 		}
 	}
 
-	for _, entry := range(logs) {
+	for _, entry := range(logs.logs) {
 		fmt.Println("entry:", entry.Index, "term:", entry.Term)
 	}
 	// if leader's term is greater or equal, its leadership is valid
@@ -263,7 +276,9 @@ func LeaderElection() {
 						lastAppliedIndex = 0
 						//initialize next_index for all nodes.
 						for _, server := range(serverNodes) {
-							nextIndex[server.serverID] = len(logs)
+							nextIndex.m.Lock()
+							nextIndex.nextIndex[server.serverID] = len(logs.logs)
+							nextIndex.m.Unlock()
 						}
 						go Heartbeat()  // begins sending heartbeats
 						return
@@ -329,7 +344,11 @@ func clientAddToLog() {
 	if isLeader {
 		// lastAppliedIndex here is an int variable that is needed by a node to store the value of the last index it used in the log
 		entry := LogEntry{lastAppliedIndex, currentTerm}
-		logs = append(logs, entry) //append new entry to our log.
+		logs.m.Lock()
+		logs.logs = append(logs.logs, entry) //append new entry to our log.
+		l := len(logs.logs)
+		prevTerm := logs.logs[l-1].Term
+		logs.m.Unlock()
 		log.Println("Client communication created the new log entry at index " + strconv.Itoa(entry.Index))
 		lastAppliedIndex++
 
@@ -337,23 +356,30 @@ func clientAddToLog() {
 			Term:     currentTerm,
 			LeaderID: selfID,
 			Address:  myPort,
-			PrevLogIndex: len(logs)-1,
-			PrevLogTerm: logs[len(logs)-1].Term,
+			PrevLogIndex: l - 1,
+			PrevLogTerm: prevTerm,
 		}
 		mutex.Unlock()
 
 		for _, server := range serverNodes {
 			go func(server ServerConnection) {
-				arguments.Entries = logs[nextIndex[server.serverID]:] //from the next index onward.
+				nextIndex.m.Lock()
+				ni := nextIndex.nextIndex[server.serverID]
+				nextIndex.m.Unlock()
 				reply := AppendEntryReply{}
 				for { //keep trying if there are errors
+					logs.m.Lock()
+					arguments.Entries = logs.logs[ni:] //from the next index onward.
+					logs.m.Unlock()
 					server.rpcConnection.Call("RaftNode.AppendEntry", arguments, &reply)
-					if reply.Success {
+					if reply.Success || ni <= 0 {
 						break; //good job no errors
 					}
-					nextIndex[server.serverID] -= 1 //check for <0 condition?... should not occur
+					ni -= 1
 				}
-				nextIndex[server.serverID] = len(logs) //onto the next thing.
+				nextIndex.m.Lock()
+				nextIndex.nextIndex[server.serverID] = l //onto the next thing.
+				nextIndex.m.Unlock()	
 			}(server)
 		}
 	} else {
@@ -417,6 +443,7 @@ func main() {
 	votedFor = -1
 	isLeader = false // starts in the follower state
 	mutex = sync.Mutex{}
+	logs = Logs{logs:make([]LogEntry, 0)}
 
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	tRandom := time.Duration(r.Intn(150)+151) * time.Millisecond
@@ -466,7 +493,7 @@ func main() {
 		fmt.Println("Connected to " + element)
 	}
 
-	nextIndex = make(map[int]int)
+	nextIndex = indexMap{nextIndex:make(map[int]int)}
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go LeaderElection() // concurrent and non-stop leader election
