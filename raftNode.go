@@ -42,6 +42,9 @@ type AppendEntryArgument struct {
 	Term     int
 	LeaderID int
 	Address  string
+	PrevLogIndex int
+	PrevLogTerm int
+	Entries []LogEntry
 }
 
 // AppendEntryReply represents the response from a Raft node after processing a
@@ -112,11 +115,16 @@ func (*RaftNode) RequestVote(arguments VoteArguments, reply *VoteReply) error {
 	reply.Term = currentTerm
 
 	// grant vote if node has not voted
-	if votedFor == -1 && arguments.Index >= logs[len(logs)-1:][0].Index {
-		fmt.Println("Voting for candidate", arguments.CandidateID)
-		reply.ResultVote = true
-		votedFor = arguments.CandidateID
-		resetElectionTimeout()
+	if votedFor == -1 {
+		if arguments.Term > logs[len(logs)-1:][0].Term || (arguments.Term == logs[len(logs)-1:][0].Term && arguments.Index >= logs[len(logs)-1:][0].Index) {
+			fmt.Println("Voting for candidate", arguments.CandidateID)
+			reply.ResultVote = true
+			votedFor = arguments.CandidateID
+			resetElectionTimeout()
+		} else {
+			reply.ResultVote = false
+		}
+		
 	} else {
 		reply.ResultVote = false
 	}
@@ -161,9 +169,24 @@ func (*RaftNode) AppendEntry(arguments AppendEntryArgument, reply *AppendEntryRe
 	if arguments.Term < currentTerm {
 		reply.Term = currentTerm
 		reply.Success = false // not a valid heartbeat
-		isLeader = false
 		go Reconnect(arguments.LeaderID, arguments.Address)
 		return nil
+	}
+	if logs[arguments.PrevLogIndex].Term != arguments.PrevLogTerm {
+		reply.Success = false
+		log.Println("received conflicting log from leader")
+		//go Reconnect(arguments.LeaderID, arguments.Address)
+		return nil
+	}
+
+	for i, entry := range(arguments.Entries) {
+		if entry.Index >= len(logs) {
+			logs = append(logs, arguments.Entries[i:]...) //append all new.
+			break; //done here
+		}
+		if logs[entry.Index].Term != entry.Term {
+			logs[entry.Index] = entry //correct the inorrect entry
+		}
 	}
 
 	// if leader's term is greater or equal, its leadership is valid
@@ -229,6 +252,7 @@ func LeaderElection() {
 					if !isLeader && voteCount > len(serverNodes)/2 {
 						fmt.Println("Won election! ->", voteCount, "votes for", selfID)
 						isLeader = true // enters leader state
+						lastAppliedIndex = 0
 						go Heartbeat()  // begins sending heartbeats
 						return
 					}
