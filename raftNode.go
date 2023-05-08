@@ -302,7 +302,9 @@ func LeaderElection() {
 		for _, server := range(serverNodes) {
 			go func(server *ServerConnection) {
 				reply := VoteReply{}
+				server.m.Lock()
 				err := server.rpcConnection.Call("RaftNode.RequestVote", arguments, &reply)
+				server.m.Unlock()
 				if err != nil {
 					return
 				}
