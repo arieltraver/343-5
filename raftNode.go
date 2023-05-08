@@ -60,6 +60,7 @@ type ServerConnection struct {
 	serverID      int
 	Address       string
 	rpcConnection *rpc.Client
+	m sync.Mutex
 }
 
 type LogEntry struct {
@@ -77,16 +78,62 @@ type indexMap struct {
 	m sync.Mutex
 }
 var selfID int
-var serverNodes map[string]ServerConnection
-var currentTerm int
-var votedFor int
-var isLeader bool
+var serverNodes map[string]*ServerConnection
+var currentTerm *safeInt
+var votedFor *safeInt
+var isLeader *safeBool
 var myPort string
-var mutex sync.Mutex // to lock global variables
 var electionTimeout *time.Timer
 var logs Logs
 var lastAppliedIndex int
 var nextIndex indexMap
+
+
+type safeInt struct {
+	i int
+	m sync.Mutex
+}
+
+func (i *safeInt) add(val int) {
+	i.m.Lock()
+	defer i.m.Unlock()
+	i.i +=1
+}
+
+func(i *safeInt) changeTo(val int) {
+	i.m.Lock()
+	defer i.m.Unlock()
+	i.i = val
+}
+
+func(i *safeInt) get() int{
+	i.m.Lock()
+	defer i.m.Unlock()
+	return i.i
+}
+
+type safeBool struct {
+	b bool
+	m sync.Mutex
+}
+
+func (b *safeBool) check() bool {
+	b.m.Lock()
+	defer b.m.Unlock()
+	return b.b
+}
+
+func (b *safeBool) setTrue() {
+	b.m.Lock()
+	defer b.m.Unlock()
+	b.b = true
+}
+
+func (b *safeBool) setFalse() {
+	b.m.Lock()
+	defer b.m.Unlock()
+	b.b = false
+}
 
 // resetElectionTimeout resets the election timeout to a new random duration.
 // This function should be called whenever an event occurs that prevents the need for a new election,
@@ -102,37 +149,37 @@ func resetElectionTimeout() {
 // whether to vote for the candidate based on whether it has not voted in this
 // term and the value of the candidate's term.
 func (*RaftNode) RequestVote(arguments VoteArguments, reply *VoteReply) error {
-	mutex.Lock()
-	defer mutex.Unlock()
 
 	// reject vote request if candidate's term is lower than current term
-	if arguments.Term < currentTerm {
+	if arguments.Term < currentTerm.get() {
 		fmt.Println(arguments.CandidateID, "has term:", arguments.Term, "but current term is", currentTerm)
 
 		// if candidate has lower term, it may have failed and come back. call
 		// Reconnect() to try to update its rpc.Connection value in serverNodes
-		reply.Term = currentTerm
+		reply.Term = currentTerm.get()
 		reply.ResultVote = false
+
 		go Reconnect(arguments.CandidateID, arguments.Address)
 		return nil
 	}
 
-	if arguments.Term > currentTerm {
-		currentTerm = arguments.Term // update current term
-		votedFor = -1                // has not voted in this new term
+	if arguments.Term > currentTerm.get() {
+		fmt.Println("Current term updated line 122")
+		currentTerm.changeTo(arguments.Term) // update current term
+		votedFor.changeTo(-1)
 	}
 
-	reply.Term = currentTerm
+	reply.Term = currentTerm.get()
 
 	// grant vote if node has not voted
-	if votedFor == -1 {
+	if votedFor.get() == -1 {
 		logs.m.Lock()
 		if len(logs.logs) == 0 || (arguments.Term > logs.logs[len(logs.logs)-1].Term || (arguments.Term == logs.logs[len(logs.logs)-1].Term && arguments.Index >= logs.logs[len(logs.logs)-1].Index)) {
 			logs.m.Unlock()
 			fmt.Println("Voting for candidate", arguments.CandidateID)
 			reply.ResultVote = true
-			votedFor = arguments.CandidateID
-			resetElectionTimeout()
+			votedFor.changeTo(arguments.CandidateID)
+			go resetElectionTimeout()
 		} else {
 			reply.ResultVote = false
 		}
@@ -159,10 +206,11 @@ func Reconnect(newId int, address string) error {
 			} else {
 				fmt.Println("Reconnected with", address)
 				// close old connection and replace with new connection
-				mutex.Lock()
+				serverNodes[address].m.Lock()
 				serverNodes[address].rpcConnection.Close()
-				serverNodes[address] = ServerConnection{serverID: newId, Address: address, rpcConnection: client}
-				mutex.Unlock()
+				serverNodes[address].serverID = newId
+				serverNodes[address].rpcConnection = client
+				serverNodes[address].m.Unlock()
 				return nil
 			}
 		}
@@ -174,12 +222,10 @@ func Reconnect(newId int, address string) error {
 // and resets the election timeout, ensuring the follower does not start an election.
 // It also updates the follower's term and state, as well as the AppendEntryReply.
 func (*RaftNode) AppendEntry(arguments AppendEntryArgument, reply *AppendEntryReply) error {
-	mutex.Lock()
-	defer mutex.Unlock()
 
 	// if leader's term is less than current term, reject append entry request
-	if arguments.Term < currentTerm {
-		reply.Term = currentTerm
+	if arguments.Term < currentTerm.get() {
+		reply.Term = currentTerm.get()
 		reply.Success = false // not a valid heartbeat
 		go Reconnect(arguments.LeaderID, arguments.Address)
 		return nil
@@ -207,11 +253,11 @@ func (*RaftNode) AppendEntry(arguments AppendEntryArgument, reply *AppendEntryRe
 		fmt.Println("entry:", entry.Index, "term:", entry.Term)
 	}
 	// if leader's term is greater or equal, its leadership is valid
-	currentTerm = arguments.Term
-	isLeader = false // current node is follower
-	reply.Term = currentTerm
+	currentTerm.changeTo(arguments.Term)
+	isLeader.setFalse() // current node is follower
+	reply.Term = currentTerm.get()
 	reply.Success = true
-	resetElectionTimeout() // heartbeat indicates a leader, so no new election
+	go resetElectionTimeout() // heartbeat indicates a leader, so no new election
 	fmt.Println("Received heartbeat")
 
 	return nil
@@ -226,24 +272,20 @@ func LeaderElection() {
 	for {
 		<-electionTimeout.C // wait for election timeout
 
-		mutex.Lock()
 		// check if node is already leader so loop does not continue
-		if isLeader {
+		if isLeader.check() {
 			fmt.Println("ending leaderelection because I am now leader")
-			mutex.Unlock()
 			return
 		}
-
 		// initialize election
-		currentTerm++     // new term
-		votedFor = selfID // votes for itself
-		sc := serverNodes
-
-		mutex.Unlock()
+		fmt.Println("current term is" + strconv.Itoa(currentTerm.get()))
+		currentTerm.add(1)  // new term
+		fmt.Println("current term is" + strconv.Itoa(currentTerm.get()))
+		votedFor.changeTo(selfID)
 
 		arguments := VoteArguments{
-			Term:        currentTerm,
-			CandidateID: selfID,
+			Term:        currentTerm.get(),
+			CandidateID: votedFor.get(),
 			Address:     myPort,
 		}
 
@@ -252,32 +294,30 @@ func LeaderElection() {
 		// request votes from other nodes
 		fmt.Println("Requesting votes")
 
-		for _, server := range sc {
-			go func(server ServerConnection) {
+		for _, server := range(serverNodes) {
+			go func(server *ServerConnection) {
 				reply := VoteReply{}
 				err := server.rpcConnection.Call("RaftNode.RequestVote", arguments, &reply)
 				if err != nil {
 					return
 				}
-
-				mutex.Lock()
-
-				defer mutex.Unlock()
-
-				if reply.Term > currentTerm {
-					currentTerm = reply.Term // update current term
-					votedFor = -1            // reset votedFor
+				if reply.Term > currentTerm.get() {
+					currentTerm.changeTo(reply.Term) // update current term
+					fmt.Println("Current term updated line 272")
+					votedFor.changeTo(-1)          // reset votedFor
 				} else if reply.ResultVote {
 					voteCount++
 					// receives votes from a majority of the servers
-					if !isLeader && voteCount > len(serverNodes)/2 {
+					if !isLeader.check() && voteCount > len(serverNodes)/2 {
 						fmt.Println("Won election! ->", voteCount, "votes for", selfID)
-						isLeader = true // enters leader state
+						isLeader.setTrue() // enters leader state
 						lastAppliedIndex = 0
 						//initialize next_index for all nodes.
 						for _, server := range(serverNodes) {
 							nextIndex.m.Lock()
+							server.m.Lock()
 							nextIndex.nextIndex[server.serverID] = len(logs.logs)
+							server.m.Unlock()
 							nextIndex.m.Unlock()
 						}
 						go Heartbeat()  // begins sending heartbeats
@@ -287,7 +327,7 @@ func LeaderElection() {
 
 			}(server)
 		}
-		resetElectionTimeout()
+		go resetElectionTimeout()
 	}
 }
 
@@ -298,24 +338,22 @@ func Heartbeat() {
 	heartbeatTimer := time.NewTimer(100 * time.Millisecond)
 	for {
 		<-heartbeatTimer.C
-		mutex.Lock()
-		if !isLeader {
-			mutex.Unlock()
+		if !isLeader.check() {
 			return
 		}
 
 		arguments := AppendEntryArgument{
-			Term:     currentTerm,
+			Term:     currentTerm.get(),
 			LeaderID: selfID,
 			Address:  myPort,
 		}
-		mutex.Unlock()
-
 		fmt.Println("Sending heartbeats")
 		for _, server := range serverNodes {
-			go func(server ServerConnection) {
+			go func(server *ServerConnection) {
 				reply := AppendEntryReply{}
+				server.m.Lock()
 				server.rpcConnection.Call("RaftNode.AppendEntry", arguments, &reply)
+				server.m.Unlock()
 			}(server)
 		}
 		heartbeatTimer.Reset(100 * time.Millisecond)
@@ -339,11 +377,9 @@ func clientAddToLog() {
 	// In this implementation, we are pretending that the client reached out to the server somehow
 	// But any new log entries will not be created unless the server/node is a leader
 	// isLeader here is a boolean to indicate whether the node is a leader or not
-	mutex.Lock()
-
-	if isLeader {
+	if isLeader.check() {
 		// lastAppliedIndex here is an int variable that is needed by a node to store the value of the last index it used in the log
-		entry := LogEntry{lastAppliedIndex, currentTerm}
+		entry := LogEntry{lastAppliedIndex, currentTerm.get()}
 		logs.m.Lock()
 		logs.logs = append(logs.logs, entry) //append new entry to our log.
 		l := len(logs.logs)
@@ -353,16 +389,14 @@ func clientAddToLog() {
 		lastAppliedIndex++
 
 		arguments := AppendEntryArgument{
-			Term:     currentTerm,
+			Term:     currentTerm.get(),
 			LeaderID: selfID,
 			Address:  myPort,
 			PrevLogIndex: l - 1,
 			PrevLogTerm: prevTerm,
 		}
-		mutex.Unlock()
-
 		for _, server := range serverNodes {
-			go func(server ServerConnection) {
+			go func(server *ServerConnection) {
 				nextIndex.m.Lock()
 				ni := nextIndex.nextIndex[server.serverID]
 				nextIndex.m.Unlock()
@@ -371,7 +405,9 @@ func clientAddToLog() {
 					logs.m.Lock()
 					arguments.Entries = logs.logs[ni:] //from the next index onward.
 					logs.m.Unlock()
+					server.m.Lock()
 					server.rpcConnection.Call("RaftNode.AppendEntry", arguments, &reply)
+					server.m.Unlock()
 					if reply.Success || ni <= 0 {
 						break; //good job no errors
 					}
@@ -382,8 +418,6 @@ func clientAddToLog() {
 				nextIndex.m.Unlock()	
 			}(server)
 		}
-	} else {
-		mutex.Unlock()
 	}
 	/* HINT 2: force the thread to sleep for a good amount of time (less
 	   than that of the leader election timer) and then repeat the actions above.
@@ -439,10 +473,10 @@ func main() {
 
 	// -- Initialize global variables
 	selfID = myID
-	currentTerm = 0
-	votedFor = -1
-	isLeader = false // starts in the follower state
-	mutex = sync.Mutex{}
+	currentTerm = &safeInt{i:0}
+	votedFor = &safeInt{i:-1}
+	isLeader = &safeBool{b:false}// starts in the follower state
+	// mutex = sync.Mutex{}
 	logs = Logs{logs:make([]LogEntry, 0)}
 
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -475,7 +509,7 @@ func main() {
 	// Pro: Realistic setup
 	// Con: If one server is not set up correctly, the rest of the system will halt
 
-	serverNodes = make(map[string]ServerConnection)
+	serverNodes = make(map[string]*ServerConnection)
 	for index, element := range lines {
 		// Attempt to connect to the other server node
 		client, err := rpc.DialHTTP("tcp", element)
@@ -488,7 +522,7 @@ func main() {
 		}
 		// Once connection is finally established
 		// Save that connection information in the servers map
-		serverNodes[element] = ServerConnection{index, element, client}
+		serverNodes[element] = &ServerConnection{index, element, client, sync.Mutex{}}
 		// Record that in log
 		fmt.Println("Connected to " + element)
 	}
@@ -499,6 +533,4 @@ func main() {
 	go LeaderElection() // concurrent and non-stop leader election
 	go client()
 	wg.Wait()           // waits forever, so main process does not stop
-
-
 }
