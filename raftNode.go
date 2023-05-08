@@ -85,7 +85,7 @@ var isLeader *safeBool
 var myPort string
 var electionTimeout *time.Timer
 var logs Logs
-var lastAppliedIndex int
+var lastAppliedIndex *safeInt
 var nextIndex indexMap
 
 
@@ -140,7 +140,7 @@ func (b *safeBool) setFalse() {
 // such as receiving a heartbeat from the leader or granting a vote to a candidate.
 func resetElectionTimeout() {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	duration := time.Duration(r.Intn(150)+151) * time.Millisecond
+	duration := time.Duration(r.Intn(300)+301) * time.Millisecond
 	electionTimeout.Stop()          // Use Reset method only on stopped or expired timers
 	electionTimeout.Reset(duration) // Resets the timer to new random value
 }
@@ -152,7 +152,7 @@ func (*RaftNode) RequestVote(arguments VoteArguments, reply *VoteReply) error {
 
 	// reject vote request if candidate's term is lower than current term
 	if arguments.Term < currentTerm.get() {
-		fmt.Println(arguments.CandidateID, "has term:", arguments.Term, "but current term is", currentTerm)
+		fmt.Println(arguments.CandidateID, "has term:", arguments.Term, "but current term is", currentTerm.get())
 
 		// if candidate has lower term, it may have failed and come back. call
 		// Reconnect() to try to update its rpc.Connection value in serverNodes
@@ -288,18 +288,17 @@ func LeaderElection() {
 		fmt.Println("current term is" + strconv.Itoa(currentTerm.get()))
 		votedFor.changeTo(selfID)
 
-		arguments := VoteArguments{
-			Term:        currentTerm.get(),
-			CandidateID: votedFor.get(),
-			Address:     myPort,
-		}
-
 		voteCount := &safeInt{i:0}
 
 		// request votes from other nodes
 		fmt.Println("Requesting votes")
 
 		for _, server := range(serverNodes) {
+			arguments := VoteArguments{
+				Term:        currentTerm.get(),
+				CandidateID: votedFor.get(),
+				Address:     myPort,
+			}
 			go func(server *ServerConnection) {
 				reply := VoteReply{}
 				server.m.Lock()
@@ -318,7 +317,7 @@ func LeaderElection() {
 					if !isLeader.check() && voteCount.get() > len(serverNodes)/2 {
 						fmt.Println("Won election! ->", voteCount, "votes for", selfID)
 						isLeader.setTrue() // enters leader state
-						lastAppliedIndex = 0
+						lastAppliedIndex.changeTo(0)
 						//initialize next_index for all nodes.
 						for _, server := range(serverNodes) {
 							nextIndex.m.Lock()
@@ -386,14 +385,14 @@ func clientAddToLog() {
 	// isLeader here is a boolean to indicate whether the node is a leader or not
 	if isLeader.check() {
 		// lastAppliedIndex here is an int variable that is needed by a node to store the value of the last index it used in the log
-		entry := LogEntry{lastAppliedIndex, currentTerm.get()}
+		entry := LogEntry{lastAppliedIndex.get(), currentTerm.get()}
 		logs.m.Lock()
 		logs.logs = append(logs.logs, entry) //append new entry to our log.
 		l := len(logs.logs)
 		prevTerm := logs.logs[l-1].Term
 		logs.m.Unlock()
 		log.Println("Client communication created the new log entry at index " + strconv.Itoa(entry.Index))
-		lastAppliedIndex++
+		lastAppliedIndex.add(1)
 
 		for _, server := range serverNodes {
 			go func(server *ServerConnection) {
@@ -483,14 +482,15 @@ func main() {
 
 	// -- Initialize global variables
 	selfID = myID
-	currentTerm = &safeInt{i:0}
+	currentTerm = &safeInt{i:-1}
 	votedFor = &safeInt{i:-1}
 	isLeader = &safeBool{b:false}// starts in the follower state
 	// mutex = sync.Mutex{}
 	logs = Logs{logs:make([]LogEntry, 0)}
+	lastAppliedIndex = &safeInt{i:0}
 
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	tRandom := time.Duration(r.Intn(150)+151) * time.Millisecond
+	tRandom := time.Duration(r.Intn(300)+301) * time.Millisecond
 	electionTimeout = time.NewTimer(tRandom)
 
 	// --- Register the RPCs of this object of type RaftNode
