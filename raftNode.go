@@ -165,7 +165,7 @@ func (*RaftNode) RequestVote(arguments VoteArguments, reply *VoteReply) error {
 
 	if arguments.Term > currentTerm.get() {
 		fmt.Println("Current term updated line 122")
-		currentTerm.changeTo(arguments.Term) // update current term
+		//currentTerm.changeTo(arguments.Term) // update current term
 		votedFor.changeTo(-1)
 	}
 
@@ -289,7 +289,7 @@ func LeaderElection() {
 			Address:     myPort,
 		}
 
-		voteCount := 1
+		voteCount := &safeInt{i:0}
 
 		// request votes from other nodes
 		fmt.Println("Requesting votes")
@@ -306,9 +306,9 @@ func LeaderElection() {
 					fmt.Println("Current term updated line 272")
 					votedFor.changeTo(-1)          // reset votedFor
 				} else if reply.ResultVote {
-					voteCount++
+					voteCount.add(1)
 					// receives votes from a majority of the servers
-					if !isLeader.check() && voteCount > len(serverNodes)/2 {
+					if !isLeader.check() && voteCount.get() > len(serverNodes)/2 {
 						fmt.Println("Won election! ->", voteCount, "votes for", selfID)
 						isLeader.setTrue() // enters leader state
 						lastAppliedIndex = 0
