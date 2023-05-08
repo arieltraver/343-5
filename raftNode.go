@@ -164,7 +164,7 @@ func (*RaftNode) RequestVote(arguments VoteArguments, reply *VoteReply) error {
 	}
 
 	if arguments.Term > currentTerm.get() {
-		fmt.Println("Current term updated line 122")
+	//	fmt.Println("Current term updated line 122")
 		//currentTerm.changeTo(arguments.Term) // update current term
 		votedFor.changeTo(-1)
 	}
@@ -388,17 +388,19 @@ func clientAddToLog() {
 		log.Println("Client communication created the new log entry at index " + strconv.Itoa(entry.Index))
 		lastAppliedIndex++
 
-		arguments := AppendEntryArgument{
-			Term:     currentTerm.get(),
-			LeaderID: selfID,
-			Address:  myPort,
-			PrevLogIndex: l - 1,
-			PrevLogTerm: prevTerm,
-		}
 		for _, server := range serverNodes {
 			go func(server *ServerConnection) {
+				arguments := AppendEntryArgument{
+					Term:     currentTerm.get(),
+					LeaderID: selfID,
+					Address:  myPort,
+					PrevLogIndex: l - 1,
+					PrevLogTerm: prevTerm,
+				}
 				nextIndex.m.Lock()
+				server.m.Lock()
 				ni := nextIndex.nextIndex[server.serverID]
+				server.m.Unlock()
 				nextIndex.m.Unlock()
 				reply := AppendEntryReply{}
 				for { //keep trying if there are errors
