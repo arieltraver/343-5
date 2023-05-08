@@ -315,7 +315,7 @@ func LeaderElection() {
 					voteCount.add(1)
 					// receives votes from a majority of the servers
 					if !isLeader.check() && voteCount.get() > len(serverNodes)/2 {
-						fmt.Println("Won election! ->", voteCount, "votes for", selfID)
+						fmt.Println("Won election! ->", voteCount.get(), "votes for", selfID)
 						isLeader.setTrue() // enters leader state
 						lastAppliedIndex.changeTo(0)
 						//initialize next_index for all nodes.
