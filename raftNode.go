@@ -236,6 +236,11 @@ func (*RaftNode) AppendEntry(arguments AppendEntryArgument, reply *AppendEntryRe
 		//go Reconnect(arguments.LeaderID, arguments.Address)
 		return nil
 	}
+	if len(logs.logs) == 0 && arguments.PrevLogIndex > 0 {
+		reply.Success = false
+		log.Println("our log is empty, received non-empty log")
+		return nil
+	}
 
 	for i, entry := range(arguments.Entries) {
 		if entry.Index >= len(logs.logs) {
@@ -406,6 +411,7 @@ func clientAddToLog() {
 				for { //keep trying if there are errors
 					logs.m.Lock()
 					arguments.Entries = logs.logs[ni:] //from the next index onward.
+					arguments.PrevLogIndex -= 1
 					logs.m.Unlock()
 					server.m.Lock()
 					server.rpcConnection.Call("RaftNode.AppendEntry", arguments, &reply)
